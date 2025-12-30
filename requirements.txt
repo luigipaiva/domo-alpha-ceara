@@ -1,0 +1,8 @@
+streamlit
+earthengine-api
+geemap
+pandas
+geopandas
+requests
+google-generativeai
+shapely
