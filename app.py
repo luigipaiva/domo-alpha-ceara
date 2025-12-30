@@ -220,4 +220,4 @@ if st.session_state['roi'] and connected:
     key_mapa = st.session_state.get('map_key', 'map_default')
     m.to_streamlit(height=600, key=key_mapa)
 
-Ajuste este algoritmo
+
