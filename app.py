@@ -9,8 +9,8 @@ from shapely.geometry import shape
 from shapely.ops import unary_union
 import json
 
-# --- 1. SETUP E AUTENTICAÇÃO ---
-st.set_page_config(layout="wide", page_title="DOMO Alpha Earth - Hídrico")
+# --- 1. SETUP E CONEXÃO ---
+st.set_page_config(layout="wide", page_title="DOMO Híbrido - Landsat/Sentinel")
 
 PROJECT_ID = st.secrets.get("PROJECT_ID", "domo-alpha-ia")
 API_KEY = st.secrets.get("API_KEY")
@@ -34,7 +34,7 @@ def init_ee_enterprise():
             ee.Initialize(project=PROJECT_ID)
             return True
     except Exception as e:
-        st.error(f"❌ Erro de Autenticação: {e}")
+        st.error(f"❌ Erro: {e}")
         return False
 
 connected = init_ee_enterprise()
@@ -45,7 +45,7 @@ def load_model():
     except: return None
 model = load_model()
 
-# --- 2. DADOS E GEOMETRIA ---
+# --- 2. CACHE GEOGRÁFICO ---
 @st.cache_data(ttl=86400)
 def get_ceara_cities():
     return requests.get("https://servicodados.ibge.gov.br/api/v1/localidades/estados/23/municipios?orderBy=nome").json()
@@ -62,18 +62,17 @@ def get_fast_geometry(mun_ids):
         except: continue
     return unary_union(geoms).buffer(0)
 
-for key in ['roi', 'domo_map', 'roi_name', 'map_bounds', 'last_scan_data', 'legend_title', 'img_date']:
+for key in ['roi', 'domo_map', 'roi_name', 'map_bounds', 'legend_title', 'sat_source']:
     if key not in st.session_state: st.session_state[key] = None
 
 # --- 3. INTERFACE ---
 with st.sidebar:
-    st.title("🌵 DOMO Alpha Earth")
-    if connected: st.success("🛰️ Sistema Online")
+    st.title("🛰️ DOMO Multi-Sensor")
+    st.caption("Fusão Landsat 9 + Sentinel-2")
     
-    st.divider()
     modo = st.radio(
-        "Lente de Análise:",
-        ["🌳 Desmatamento", "💧 Espelho D'água (MNDWI)", "🧪 Qualidade (NDCI)", "🔥 Queimadas (NBR)"]
+        "Objetivo da Análise:",
+        ["💧 Espelho D'água (Landsat 9)", "🧪 Clorofila/Algas (Sentinel-2)", "🌳 Desmatamento (Sentinel-2)"]
     )
     
     st.divider()
@@ -82,9 +81,9 @@ with st.sidebar:
         selecao = st.multiselect("Municípios", [m['nome'] for m in municipios])
     except: st.error("Erro IBGE")
 
-    if st.button("📍 CARREGAR ÁREA", type="primary", use_container_width=True, disabled=not connected):
+    if st.button("📍 CARREGAR ÁREA", type="primary", disabled=not connected):
         if selecao:
-            with st.spinner("Carregando polígono..."):
+            with st.spinner("Definindo geometria..."):
                 ids = [m['id'] for m in municipios if m['nome'] in selecao]
                 geom = get_fast_geometry(ids)
                 gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
@@ -92,94 +91,84 @@ with st.sidebar:
                 st.session_state['roi_name'] = ", ".join(selecao)
                 b = st.session_state['roi'].bounds().getInfo()['coordinates'][0]
                 st.session_state['map_bounds'] = [[min([p[1] for p in b]), min([p[0] for p in b])], [max([p[1] for p in b]), max([p[0] for p in b])]]
-                st.success("Área Pronta!")
+                st.success("Pronto.")
 
-# --- 4. MOTOR DE ANÁLISE ---
+# --- 4. MOTOR HÍBRIDO ---
 if st.session_state['roi'] and connected:
-    st.caption(f"Analisando: {st.session_state['roi_name']}")
     m = geemap.Map()
     if st.session_state['map_bounds']: m.fit_bounds(st.session_state['map_bounds'])
     
-    if st.button(f"⚡ PROCESSAR: {modo}"):
-        with st.spinner("Baixando dados do Sentinel-2..."):
-            roi = st.session_state['roi']
-            
-            # Seleciona bandas: B3(Green), B4(Red), B5(RedEdge), B8(NIR), B11(SWIR1)
-            # Trocamos B12 por B11 para melhor MNDWI
-            s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(roi).select(['B3', 'B4', 'B5', 'B8', 'B11'])
-            
-            # Tenta pegar a imagem mais recente com menos de 20% de nuvens
-            img_hoje = s2.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)).sort('system:time_start', False).first()
-            
-            # Pega a data da imagem para auditoria
-            try:
-                date_info = img_hoje.date().format('dd/MM/YYYY').getInfo()
-                st.session_state['img_date'] = date_info
-            except:
-                st.session_state['img_date'] = "Data Indisponível"
-
-            layer_name = "Resultado"
-            vis_params = {}
-            
-            # --- 1. DESMATAMENTO ---
-            if "Desmatamento" in modo:
-                ref_hist = s2.filterDate('2023-01-01', '2024-12-31').median()
-                ndvi_now = img_hoje.normalizedDifference(['B8','B4'])
-                ndvi_ref = ref_hist.normalizedDifference(['B8','B4'])
-                alerta = ndvi_now.lt(0.2).And(ndvi_ref.gt(0.45)).selfMask()
-                st.session_state['domo_map'] = alerta.updateMask(alerta.connectedPixelCount(30).gte(15)).clip(roi)
-                vis_params = {'palette': ['red']}
-                layer_name = "Supressão"
-
-            # --- 2. ESPELHO D'ÁGUA (MNDWI) ---
-            elif "MNDWI" in modo:
-                # CORREÇÃO: Usando MNDWI (Green - SWIR1) / (Green + SWIR1)
-                # Muito melhor para açudes barrentos que o NDWI comum
-                mndwi = img_hoje.normalizedDifference(['B3', 'B11'])
+    if st.button(f"⚡ EXECUTAR: {modo.split('(')[0]}"):
+        roi = st.session_state['roi']
+        vis_params = {}
+        layer_name = ""
+        
+        # --- MOTOR 1: LANDSAT 9 (PARA ÁGUA) ---
+        if "Landsat" in modo:
+            with st.spinner("Acessando Landsat 9 OLI-2..."):
+                # Coleção Landsat 9 Level 2 (Reflectância de Superfície)
+                l9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2").filterBounds(roi)
+                img = l9.filter(ee.Filter.lt('CLOUD_COVER', 15)).sort('system:time_start', False).first()
                 
-                # CORREÇÃO: Baixei o limiar para -0.1 para pegar água turva
-                water_mask = mndwi.gt(-0.1)
-                st.session_state['domo_map'] = mndwi.updateMask(water_mask).clip(roi)
+                if img:
+                    # Landsat Bands: SR_B3 (Green), SR_B6 (SWIR 1)
+                    # MNDWI = (Green - SWIR) / (Green + SWIR)
+                    green = img.select('SR_B3').multiply(0.0000275).add(-0.2)
+                    swir = img.select('SR_B6').multiply(0.0000275).add(-0.2)
+                    
+                    mndwi = green.subtract(swir).divide(green.add(swir))
+                    
+                    # Máscara de água (Landsat costuma ser bem preciso com > 0)
+                    st.session_state['domo_map'] = mndwi.updateMask(mndwi.gt(0.0)).clip(roi)
+                    st.session_state['sat_source'] = "Landsat 9 (30m)"
+                    vis_params = {'min': 0, 'max': 0.6, 'palette': ['white', 'blue', 'navy']}
+                    layer_name = "Espelho D'água (Landsat)"
+                else: st.warning("Sem imagem Landsat limpa recente.")
+
+        # --- MOTOR 2: SENTINEL-2 (PARA CLOROFILA E MATAS) ---
+        else:
+            with st.spinner("Acessando Sentinel-2 MSI..."):
+                s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(roi)
+                img = s2.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)).sort('system:time_start', False).first()
                 
-                vis_params = {'min': -0.1, 'max': 0.5, 'palette': ['white', 'blue', 'navy']}
-                layer_name = "Corpos Hídricos"
+                if img:
+                    st.session_state['sat_source'] = "Sentinel-2 (10m)"
+                    
+                    if "Clorofila" in modo:
+                        # NDCI = (RedEdge - Red) / (RedEdge + Red)
+                        # Sentinel Bands: B5 (Red Edge 1), B4 (Red)
+                        ndci = img.normalizedDifference(['B5', 'B4'])
+                        
+                        # Usamos MNDWI do Sentinel apenas para recortar onde é água
+                        mask_water = img.normalizedDifference(['B3', 'B11']).gt(-0.1)
+                        
+                        st.session_state['domo_map'] = ndci.updateMask(mask_water).clip(roi)
+                        vis_params = {'min': 0.0, 'max': 0.15, 'palette': ['blue', 'cyan', 'lime', 'yellow', 'red']}
+                        layer_name = "NDCI (Algas)"
+                        
+                    elif "Desmatamento" in modo:
+                        ref_hist = s2.filterDate('2023-01-01', '2024-12-31').median()
+                        ndvi_now = img.normalizedDifference(['B8','B4'])
+                        ndvi_ref = ref_hist.normalizedDifference(['B8','B4'])
+                        alerta = ndvi_now.lt(0.2).And(ndvi_ref.gt(0.45)).selfMask()
+                        st.session_state['domo_map'] = alerta.updateMask(alerta.connectedPixelCount(30).gte(15)).clip(roi)
+                        vis_params = {'palette': ['red']}
+                        layer_name = "Desmatamento"
+                else: st.warning("Sem imagem Sentinel limpa recente.")
 
-            # --- 3. CLOROFILA (NDCI) ---
-            elif "NDCI" in modo:
-                # Usa o mesmo MNDWI robusto para achar a água primeiro
-                mndwi = img_hoje.normalizedDifference(['B3', 'B11'])
-                water_mask = mndwi.gt(-0.1)
-                
-                # Calcula NDCI apenas onde tem água
-                ndci = img_hoje.normalizedDifference(['B5', 'B4']).updateMask(water_mask)
-                st.session_state['domo_map'] = ndci.clip(roi)
-                
-                # Ajuste de visualização para realçar algas
-                vis_params = {'min': 0.0, 'max': 0.15, 'palette': ['blue', 'cyan', 'lime', 'yellow', 'red']}
-                layer_name = "Clorofila-a"
+        st.session_state['legend_title'] = layer_name
+        st.session_state['vis_params'] = vis_params
 
-            # --- 4. QUEIMADAS (NBR) ---
-            elif "NBR" in modo:
-                nbr = img_hoje.normalizedDifference(['B8', 'B11'])
-                st.session_state['domo_map'] = nbr.updateMask(nbr.lt(-0.1)).clip(roi)
-                vis_params = {'min': -0.5, 'max': -0.1, 'palette': ['black', 'orange', 'red']}
-                layer_name = "Queimada"
-
-            st.session_state['legend_title'] = layer_name
-            st.session_state['vis_params'] = vis_params
-
-    # EXIBIÇÃO
-    if st.session_state.get('img_date'):
-        st.info(f"📅 Data da Imagem de Satélite: {st.session_state['img_date']}")
-
+    # Exibição
     if st.session_state['domo_map']:
+        st.info(f"Fonte do Dado: {st.session_state.get('sat_source')}")
         vis = st.session_state.get('vis_params', {})
         name = st.session_state.get('legend_title', 'Layer')
         m.addLayer(st.session_state['domo_map'], vis, name)
         
-        if "MNDWI" in modo:
-            m.add_colorbar(vis, label="Índice de Água (Branco=Raso/Barro, Azul=Fundo)")
-        elif "NDCI" in modo:
-             m.add_colorbar(vis, label="Risco de Eutrofização (Vermelho=Crítico)")
+        if "Landsat" in modo:
+             m.add_colorbar(vis, label="Profundidade/Água (Landsat)")
+        elif "Clorofila" in modo:
+             m.add_colorbar(vis, label="Concentração de Algas (Sentinel)")
 
     m.to_streamlit(height=600)
