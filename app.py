@@ -10,8 +10,8 @@ from shapely.ops import unary_union
 import json
 import uuid
 
-# --- 1. SETUP ---
-st.set_page_config(layout="wide", page_title="DOMO Alpha - Dashboard")
+# --- 1. CONFIGURAÇÃO ---
+st.set_page_config(layout="wide", page_title="DOMO Alpha - Turbo")
 
 PROJECT_ID = st.secrets.get("PROJECT_ID", "domo-alpha-ia")
 API_KEY = st.secrets.get("API_KEY")
@@ -46,7 +46,7 @@ def load_model():
     except: return None
 model = load_model()
 
-# --- 2. AUXILIARES ---
+# --- 2. CACHE INTELIGENTE ---
 @st.cache_data(ttl=86400)
 def get_ceara_cities():
     return requests.get("https://servicodados.ibge.gov.br/api/v1/localidades/estados/23/municipios?orderBy=nome").json()
@@ -65,17 +65,18 @@ def get_fast_geometry(mun_ids):
     return unary_union(geoms).buffer(0)
 
 def calculate_hectares(image_mask, geometry, scale=30):
-    """Calcula a área em hectares de uma máscara binária (0 ou 1)"""
+    """Cálculo otimizado de área"""
     pixel_area = ee.Image.pixelArea().updateMask(image_mask)
+    # bestEffort=True permite que o Google ajuste a escala se a área for muito grande
     stats = pixel_area.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=geometry,
         scale=scale,
-        maxPixels=1e9,
+        maxPixels=1e10, # Aumentado limite de pixels
         bestEffort=True
     )
     area_m2 = stats.getInfo().get('area', 0)
-    return area_m2 / 10000  # Converte m² para Hectares
+    return area_m2 / 10000
 
 # Reset Session
 for key in ['roi', 'domo_map', 'roi_name', 'map_bounds', 'legend_title', 'sat_source', 'map_key', 'metric_area']:
@@ -83,7 +84,7 @@ for key in ['roi', 'domo_map', 'roi_name', 'map_bounds', 'legend_title', 'sat_so
 
 # --- 3. SIDEBAR ---
 with st.sidebar:
-    st.title("📊 DOMO Analytics")
+    st.title("⚡ DOMO Turbo")
     
     modo = st.radio(
         "Monitoramento:",
@@ -98,7 +99,7 @@ with st.sidebar:
 
     if st.button("📍 CARREGAR ÁREA", type="primary", disabled=not connected):
         if selecao:
-            with st.spinner("Gerando geometria..."):
+            with st.spinner("Geometria..."):
                 st.session_state['domo_map'] = None
                 st.session_state['metric_area'] = None
                 
@@ -114,115 +115,107 @@ with st.sidebar:
                     st.session_state['map_key'] = str(uuid.uuid4())
                     st.success(f"Alvo: {st.session_state['roi_name']}")
 
-# --- 4. DASHBOARD ---
+# --- 4. MOTOR ---
 if st.session_state['roi'] and connected:
     
-    # 4.1 - Painel de Métricas (Topo)
+    # KPIs
     col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Municípios Alvo", len(selecao) if selecao else 0)
-    with col2:
-        val = st.session_state['metric_area']
-        label_metric = "Área Detectada"
-        if "Água" in modo: label_metric = "Espelho D'água Atual"
-        elif "Queimada" in modo: label_metric = "Área Queimada"
-        
-        st.metric(label_metric, f"{val:.2f} ha" if val is not None else "--")
-    with col3:
-        st.metric("Satélite Ativo", st.session_state['sat_source'] if st.session_state['sat_source'] else "Aguardando")
+    col1.metric("Municípios", len(selecao) if selecao else 0)
+    col2.metric("Área Detectada", f"{st.session_state['metric_area']:.2f} ha" if st.session_state['metric_area'] is not None else "--")
+    col3.metric("Satélite", st.session_state['sat_source'] if st.session_state['sat_source'] else "--")
 
-    # 4.2 - Mapa
     m = geemap.Map()
     if st.session_state['map_bounds']: m.fit_bounds(st.session_state['map_bounds'])
     
-    if st.button(f"⚡ CALCULAR E MAPEAR: {modo.split('(')[0]}"):
+    if st.button(f"🚀 EXECUTAR: {modo.split('(')[0]}"):
         roi = st.session_state['roi']
         vis_params = {}
         layer_name = ""
-        mask_final = None # Guarda a máscara para cálculo de área
-        scale_calc = 30 # Default Landsat
+        mask_final = None
+        scale_calc = 30
         
-        # --- LÓGICA LANDSAT (Água) ---
+        # --- MOTOR LANDSAT ---
         if "Landsat" in modo:
-            with st.spinner("Processando Landsat 9..."):
+            with st.spinner("Landsat 9..."):
                 l9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2").filterBounds(roi)
                 img = l9.filter(ee.Filter.lt('CLOUD_COVER', 15)).sort('system:time_start', False).first()
                 if img:
                     green = img.select('SR_B3').multiply(0.0000275).add(-0.2)
                     swir = img.select('SR_B6').multiply(0.0000275).add(-0.2)
                     mndwi = green.subtract(swir).divide(green.add(swir))
-                    
-                    mask_final = mndwi.gt(0.0) # Máscara binária
+                    mask_final = mndwi.gt(0.0)
                     st.session_state['domo_map'] = mndwi.updateMask(mask_final).clip(roi)
-                    
-                    st.session_state['sat_source'] = "Landsat 9 (30m)"
+                    st.session_state['sat_source'] = "Landsat 9"
                     vis_params = {'min': 0, 'max': 0.6, 'palette': ['white', 'blue', 'navy']}
-                    layer_name = "Água (Landsat)"
-                    scale_calc = 30
-                else: st.warning("Sem imagem Landsat.")
+                    layer_name = "Água"
+                else: st.warning("Sem Landsat limpo.")
 
-        # --- LÓGICA SENTINEL (Outros) ---
+        # --- MOTOR SENTINEL (Otimizado) ---
         else:
-            with st.spinner("Processando Sentinel-2..."):
+            with st.spinner("Sentinel-2..."):
                 s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(roi)
-                # Seleciona bandas necessárias
-                s2 = s2.select(['B3', 'B4', 'B5', 'B8', 'B11', 'B12'])
                 img = s2.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)).sort('system:time_start', False).first()
                 
                 if img:
-                    st.session_state['sat_source'] = "Sentinel-2 (10m)"
-                    scale_calc = 10
+                    st.session_state['sat_source'] = "Sentinel-2"
                     
-                    if "Clorofila" in modo:
-                        # NDCI
-                        ndci = img.normalizedDifference(['B5', 'B4'])
-                        # Water Mask (Sentinel MNDWI)
-                        water_mask = img.normalizedDifference(['B3', 'B11']).gt(-0.1)
+                    if "Desmatamento" in modo:
+                        # [OTIMIZAÇÃO CRÍTICA]
+                        # Em vez de 2 anos de histórico, pega apenas 3 meses do ano anterior
+                        # Ex: Se hoje é Jan/2025, comparamos com Nov/23 a Jan/24
+                        date_now = img.date()
+                        start_hist = date_now.advance(-13, 'month')
+                        end_hist = date_now.advance(-11, 'month')
                         
-                        mask_final = water_mask # Calculamos a área de água com potencial de algas
-                        st.session_state['domo_map'] = ndci.updateMask(water_mask).clip(roi)
-                        vis_params = {'min': 0.0, 'max': 0.15, 'palette': ['blue', 'cyan', 'lime', 'yellow', 'red']}
-                        layer_name = "Risco Algas (NDCI)"
-
-                    elif "Desmatamento" in modo:
-                        ref_hist = s2.filterDate('2023-01-01', '2024-12-31').median()
+                        # Processa apenas ~5 imagens históricas (MUITO mais rápido)
+                        ref_hist = s2.filterDate(start_hist, end_hist).median()
+                        
                         ndvi_now = img.normalizedDifference(['B8','B4'])
                         ndvi_ref = ref_hist.normalizedDifference(['B8','B4'])
-                        # Lógica de Supressão
+                        
+                        # Supressão: Era >0.45 e virou <0.2
                         alerta = ndvi_now.lt(0.2).And(ndvi_ref.gt(0.45)).selfMask()
                         mask_final = alerta.connectedPixelCount(30).gte(15)
                         
                         st.session_state['domo_map'] = alerta.updateMask(mask_final).clip(roi)
                         vis_params = {'palette': ['red']}
-                        layer_name = "Supressão Veg."
+                        layer_name = "Supressão"
+                        scale_calc = 20 # Cálculo 4x mais rápido que 10m
+
+                    elif "Clorofila" in modo:
+                        scale_calc = 20
+                        water_mask = img.normalizedDifference(['B3', 'B11']).gt(-0.1)
+                        ndci = img.normalizedDifference(['B5', 'B4'])
+                        mask_final = water_mask
+                        st.session_state['domo_map'] = ndci.updateMask(water_mask).clip(roi)
+                        vis_params = {'min': 0, 'max': 0.15, 'palette': ['blue', 'lime', 'red']}
+                        layer_name = "Algas"
 
                     elif "Queimadas" in modo:
-                        # NBR = (NIR - SWIR) / (NIR + SWIR)
+                        scale_calc = 20
                         nbr = img.normalizedDifference(['B8', 'B12'])
-                        mask_final = nbr.lt(-0.1) # Cicatriz de fogo
-                        
+                        mask_final = nbr.lt(-0.1)
                         st.session_state['domo_map'] = nbr.updateMask(mask_final).clip(roi)
                         vis_params = {'min': -0.5, 'max': -0.1, 'palette': ['black', 'orange', 'red']}
-                        layer_name = "Cicatrizes Fogo"
+                        layer_name = "Fogo"
+                else: st.warning("Sem Sentinel limpo.")
 
-                else: st.warning("Sem imagem Sentinel.")
-
-        # CÁLCULO DE ÁREA (O Cérebro do Dashboard)
         if mask_final is not None:
+            # Cálculo de área com bestEffort=True (evita timeout em áreas grandes)
             area_ha = calculate_hectares(mask_final, roi, scale_calc)
             st.session_state['metric_area'] = area_ha
             st.session_state['legend_title'] = layer_name
             st.session_state['vis_params'] = vis_params
-            st.rerun() # Recarrega a página para atualizar os números lá em cima
+            st.rerun()
 
-    # Renderiza Mapa
     if st.session_state['domo_map']:
         vis = st.session_state.get('vis_params', {})
         name = st.session_state.get('legend_title', 'Result')
         m.addLayer(st.session_state['domo_map'], vis, name)
         
-        if "Landsat" in modo: m.add_colorbar(vis, label="Profundidade")
-        elif "Clorofila" in modo: m.add_colorbar(vis, label="Conc. Algas")
+        if "Desmatamento" in modo: m.add_legend(title="Legenda", labels=["Desmatamento"], colors=["#FF0000"])
+        elif "Landsat" in modo: m.add_colorbar(vis, label="Profundidade")
+        elif "Clorofila" in modo: m.add_colorbar(vis, label="Algas")
 
     key_mapa = st.session_state.get('map_key', 'map_default')
-    m.to_streamlit(height=550, key=key_mapa)
+    m.to_streamlit(height=600, key=key_mapa)
