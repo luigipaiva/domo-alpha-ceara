@@ -2,28 +2,40 @@ import streamlit as st
 import ee
 import geemap.foliumap as geemap
 import pandas as pd
-import geopandas as gpd # Definindo gpd para evitar o NameError
+import geopandas as gpd
 import requests
 import google.generativeai as genai
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
-# --- 1. SETUP DO PROJETO GCP ---
-st.set_page_config(layout="wide", page_title="DOMO v31.1 - Alpha Earth Ceará")
+# --- 1. CONFIGURAÇÃO DE SEGURANÇA (NUVEM) ---
+st.set_page_config(layout="wide", page_title="DOMO v31.2 - Alpha Earth Ceará")
 
-PROJECT_ID = 'domo-alpha-ia' 
-API_KEY = "AIzaSyDOfhla0Wv7ulRx-kOeBYO58Qfb8CFMzDY"
+# Tenta ler das Secrets do Streamlit (Configurações avançadas no site)
+if "API_KEY" in st.secrets:
+    API_KEY = st.secrets["API_KEY"]
+    PROJECT_ID = st.secrets["PROJECT_ID"]
+else:
+    # Fallback para teste local
+    API_KEY = "AIzaSyDOfhla0Wv7ulRx-kOeBYO58Qfb8CFMzDY"
+    PROJECT_ID = "domo-alpha-ia"
+
 genai.configure(api_key=API_KEY)
 
-# Inicialização do Earth Engine vinculada ao seu projeto GCP
+# Inicialização Blindada para o Servidor
 if 'ee_init' not in st.session_state:
     try:
+        # Na nuvem, o Earth Engine usa as credenciais do Projeto registrado
         ee.Initialize(project=PROJECT_ID)
         st.session_state['ee_init'] = True
-    except:
-        ee.Authenticate()
-        ee.Initialize(project=PROJECT_ID)
-        st.session_state['ee_init'] = True
+    except Exception as e:
+        # Se falhar na nuvem, tenta o método de autenticação padrão
+        try:
+            ee.Authenticate()
+            ee.Initialize(project=PROJECT_ID)
+            st.session_state['ee_init'] = True
+        except:
+            st.error(f"Erro de Conexão: O projeto {PROJECT_ID} precisa estar registrado no Earth Engine.")
 
 @st.cache_resource
 def load_smart_model():
@@ -55,12 +67,11 @@ def get_municipio_geometry(mun_id):
 # --- 3. SIDEBAR (FOCO CEARÁ) ---
 with st.sidebar:
     st.title("🌵 DOMO - Semiárido")
-    st.caption(f"Projeto: {PROJECT_ID}")
+    st.caption(f"Projeto Ativo: {PROJECT_ID}")
     
     if st.button("⚖️ AUDITORIA ALPHA (CEARÁ)", type="primary", use_container_width=True):
         if st.session_state.get('last_scan_data') and model:
-            # IA analisa se a detecção faz sentido para o bioma Caatinga
-            prompt = f"Analise o alerta: {st.session_state['last_scan_data']} no Ceará. É desmatamento ou seca?"
+            prompt = f"Analise o alerta: {st.session_state['last_scan_data']} no Ceará. É desmatamento ou seca sazonal?"
             try: st.info(model.generate_content(prompt).text)
             except: st.error("Erro na IA.")
 
@@ -77,15 +88,14 @@ with st.sidebar:
         if mun_nomes:
             with st.spinner("Buscando limites Geográficos..."):
                 geom_list = [get_municipio_geometry([m['id'] for m in municipios if m['nome'] == n][0]) for n in mun_nomes]
-                # Correção do NameError: gpd agora está definido no topo
                 gdf = gpd.GeoDataFrame(geometry=[g for g in geom_list if g], crs="EPSG:4326")
                 st.session_state['roi'] = geemap.geopandas_to_ee(gdf).geometry()
                 st.session_state['roi_name'] = f"{', '.join(mun_nomes)} - CE"
                 b = st.session_state['roi'].bounds().getInfo()['coordinates'][0]
                 st.session_state['map_bounds'] = [[min([p[1] for p in b]), min([p[0] for p in b])], [max([p[1] for p in b]), max([p[0] for p in b])]]
-                st.success("Zona Registrada.")
+                st.success("Área Carregada.")
 
-# --- 4. MOTOR ALPHA: FILTRO DE RESILIÊNCIA DA CAATINGA ---
+# --- 4. MOTOR ALPHA: FILTRO DE CAATINGA ---
 if st.session_state['roi']:
     tab_scan, tab_calor = st.tabs(["🛰️ MONITORAMENTO CEARÁ", "🔥 FOCOS DE CALOR"])
 
@@ -94,23 +104,21 @@ if st.session_state['roi']:
         if st.session_state['map_bounds']: m1.fit_bounds(st.session_state['map_bounds'])
         
         if st.button("⚡ ESCANEAR (FILTRO ANTI-SECA SAZONAL)"):
-            with st.spinner("Cruzando dados históricos do Ceará..."):
+            with st.spinner("Analisando biomassa histórica..."):
                 roi = st.session_state['roi']
                 hoje = pd.Timestamp.now()
                 
                 s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(roi)
                 img_hoje = s2.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15)).sort('system:time_start', False).first()
-                # Comparamos com a média histórica para identificar o que é floresta perene
+                # Referência de 2 anos atrás para validar o que é perene
                 ref_hist = s2.filterDate(clean_date(hoje - pd.Timedelta(days=730)), clean_date(hoje - pd.Timedelta(days=330))).median()
                 
                 if img_hoje.bandNames().contains('B8').getInfo():
                     ndvi_now = img_hoje.normalizedDifference(['B8','B4'])
                     ndvi_ref = ref_hist.normalizedDifference(['B8','B4'])
                     
-                    # Só alerta se for solo hoje (<0.2) e no passado era vegetação estável (>0.45)
+                    # Filtro Sazonal: Solo hoje (<0.2) e Mata antes (>0.45)
                     alerta = ndvi_now.lt(0.2).And(ndvi_ref.gt(0.45)).selfMask()
-                    
-                    # Filtro de 10 pixels conectados (0.1 ha)
                     limpo = alerta.updateMask(alerta.connectedPixelCount(30).gte(10))
                     
                     area_ha = limpo.reduceRegion(reducer=ee.Reducer.count(), geometry=roi, scale=10, maxPixels=1e9).getInfo().get('nd', 0) * 0.01
@@ -120,7 +128,7 @@ if st.session_state['roi']:
                     
                     if area_ha > 0.3: st.error(f"🚨 Alerta Real na Caatinga: {area_ha:.2f} ha")
                     else: st.success(f"✅ Área Estável ({area_ha:.2f} ha)")
-                else: st.warning("Imagens nubladas.")
+                else: st.warning("Céu nublado. Tente outra data.")
 
         if st.session_state['domo_map']: m1.addLayer(st.session_state['domo_map'], {'palette': ['red']}, "Alerta Caatinga")
         m1.to_streamlit(height=500)
